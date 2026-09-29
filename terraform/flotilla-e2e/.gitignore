@@ -1,9 +1,7 @@
-.env
-*.exe
-/p3dx-fl-orchestrator
-**/.terraform/
+.terraform/
 .terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 terraform.tfvars
 crash.log
+tfplan*

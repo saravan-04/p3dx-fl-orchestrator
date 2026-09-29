@@ -1,0 +1,49 @@
+#!/bin/bash
+# Rendered by terraform/flotilla-provision and executed INSIDE this
+# data-provider VM by the Azure Custom Script Extension (runs as root via
+# the Azure guest agent — no SSH from the machine running `terraform apply`
+# is involved at all).
+set -euo pipefail
+
+FLOTILLA_DIR=/root/flotilla
+
+echo "STAGE: Installing git"
+apt-get update -y
+apt-get install -y git
+
+echo "STAGE: Installing Docker"
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sh
+fi
+systemctl enable --now docker
+
+echo "STAGE: Fetching Flotilla source (${flotilla_git_url}@${flotilla_git_ref})"
+rm -rf "$FLOTILLA_DIR"
+git clone --branch ${flotilla_git_ref} --depth 1 ${flotilla_git_url} "$FLOTILLA_DIR"
+cd "$FLOTILLA_DIR"
+
+echo "STAGE: Writing generate_dataset.py"
+printf '%s' "${generate_dataset_b64}" | base64 -d > generate_dataset.py
+
+echo "STAGE: Building flotilla-client image"
+docker build -f deployment/Dockerfile.client -t flotilla-client:${image_tag} .
+
+echo "STAGE: Generating client dataset partition"
+mkdir -p src/data src/val_data
+docker run --rm \
+  -v "$FLOTILLA_DIR/src/data:/data" \
+  -v "$FLOTILLA_DIR/src/val_data:/valdata" \
+  -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
+  flotilla-client:${image_tag} python /generate_dataset.py
+
+echo "STAGE: Starting flotilla-client (server=${server_host})"
+docker rm -f flotilla-client >/dev/null 2>&1 || true
+docker run -d --name flotilla-client --network host --restart unless-stopped \
+  -e CLIENT_NAME=${participant_name} \
+  -e CLIENT_ADVERTISE_HOST=${client_advertise_host} \
+  -e SERVER_GRPC_HOST=${server_host} \
+  -e DISCOVERY_TYPE=${discovery_type} \
+  -e DATASETS_DIR_PATH=/data \
+  -v "$FLOTILLA_DIR/src/data:/data" \
+  flotilla-client:${image_tag}
+echo "STAGE: flotilla-client started"

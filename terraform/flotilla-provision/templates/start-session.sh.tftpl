@@ -1,0 +1,21 @@
+#!/bin/bash
+# Rendered by terraform/flotilla-provision and executed INSIDE the
+# orchestrator VM by the Azure Custom Script Extension, after
+# null_resource.wait_for_clients (running locally) confirms every expected
+# client has registered.
+set -euo pipefail
+
+FLOTILLA_DIR=/root/flotilla
+
+echo "STAGE: Writing session config"
+mkdir -p "$FLOTILLA_DIR/config"
+printf '%s' "${session_config_b64}" | base64 -d > "$FLOTILLA_DIR/config/session_config.yaml"
+
+echo "STAGE: Starting FL session on orchestrator"
+docker run --rm --network host \
+  -e SERVER_ENDPOINT=localhost:12345 \
+  -e SESSION_TASK=start_session \
+  -e SESSION_CONFIG_PATH=/session/session_config.yaml \
+  -v "$FLOTILLA_DIR/config/session_config.yaml:/session/session_config.yaml:ro" \
+  flotilla-session:latest
+echo "STAGE: session request sent"

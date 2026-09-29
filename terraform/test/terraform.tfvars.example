@@ -1,0 +1,26 @@
+# Copy to terraform.tfvars and fill in your own values, then:
+#   ./deploy.sh
+
+subscription_id  = "00000000-0000-0000-0000-000000000000" # your Azure subscription ID
+role              = "data-provider"                        # or "user"
+
+# participant_name is used to name the VM. Leave it unset (commented out) and
+# deploy.sh will auto-derive it from your signed-in Azure identity (az account
+# show). Uncomment to pick your own instead:
+# participant_name = "dp1"                                 # short, unique, lowercase-with-dashes
+
+# Optional overrides (defaults shown):
+# location             = "centralindia"
+# vm_size              = "Standard_B1s"       # cheapest burstable size
+# admin_username       = "azureuser"
+# ssh_public_key_path  = "~/.ssh/id_ed25519.pub"
+# allowed_ssh_cidr     = "0.0.0.0/0"          # tighten to your own IP/32 when you can
+# os_disk_size_gb      = 30
+# os_disk_type         = "Standard_LRS"       # cheapest (HDD)
+
+# Governance layer, used to register this VM's IP so other
+# participants/tooling can look it up later — see the README's "VM
+# registration" section. localhost only works if you're provisioning from
+# the same machine/network gov_layer runs on.
+# gov_layer_url   = "http://localhost:8083/api/v1"
+# gov_layer_token = ""                        # only if gov_layer has VM_REGISTRY_TOKEN set

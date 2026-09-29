@@ -1,0 +1,39 @@
+#!/bin/bash
+# Runs LOCALLY (the machine executing `terraform apply`), not on any VM.
+# Polls flo_server.py's GET /client_status until the expected number of
+# data-provider clients have registered, so start_session only fires once
+# real connections exist.
+set -uo pipefail
+
+SERVER_IP="${server_ip}"
+PORT="${rest_port}"
+EXPECTED="${expected_clients}"
+TIMEOUT="${timeout_s}"
+ELAPSED=0
+INTERVAL=10
+
+echo "STAGE: Waiting for $EXPECTED client(s) to register with flotilla-server at $SERVER_IP:$PORT (timeout $TIMEOUT s)"
+
+count_clients() {
+  body=$(curl -sf "http://$SERVER_IP:$PORT/client_status" 2>/dev/null) || { echo 0; return; }
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("clients", {})))' 2>/dev/null || echo 0
+  else
+    printf '%s' "$body" | grep -o '"is_active"' | wc -l
+  fi
+}
+
+while true; do
+  COUNT=$(count_clients)
+  echo "STAGE: $COUNT/$EXPECTED client(s) registered so far"
+  if [ "$COUNT" -ge "$EXPECTED" ] 2>/dev/null; then
+    echo "STAGE: all expected clients registered"
+    exit 0
+  fi
+  if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+    echo "ERROR: timed out after $TIMEOUT s waiting for clients ($COUNT/$EXPECTED registered)"
+    exit 1
+  fi
+  sleep "$INTERVAL"
+  ELAPSED=$((ELAPSED + INTERVAL))
+done

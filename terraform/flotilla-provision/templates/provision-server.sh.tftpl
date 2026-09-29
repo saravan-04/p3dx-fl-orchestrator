@@ -1,0 +1,45 @@
+#!/bin/bash
+# Rendered by terraform/flotilla-provision and executed INSIDE the
+# orchestrator VM by the Azure Custom Script Extension (runs as root via
+# the Azure guest agent — no SSH from the machine running `terraform apply`
+# is involved at all).
+set -euo pipefail
+
+FLOTILLA_DIR=/root/flotilla
+
+echo "STAGE: Installing git"
+apt-get update -y
+apt-get install -y git
+
+echo "STAGE: Installing Docker"
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sh
+fi
+systemctl enable --now docker
+
+echo "STAGE: Fetching Flotilla source (${flotilla_git_url}@${flotilla_git_ref})"
+rm -rf "$FLOTILLA_DIR"
+git clone --branch ${flotilla_git_ref} --depth 1 ${flotilla_git_url} "$FLOTILLA_DIR"
+cd "$FLOTILLA_DIR"
+
+echo "STAGE: Writing generate_dataset.py"
+printf '%s' "${generate_dataset_b64}" | base64 -d > generate_dataset.py
+
+echo "STAGE: Building flotilla-server and flotilla-session images"
+docker build -f deployment/Dockerfile.server -t flotilla-server:${image_tag} .
+docker build -f deployment/Dockerfile.session -t flotilla-session:latest .
+
+echo "STAGE: Generating validation dataset partition"
+mkdir -p src/val_data src/data
+docker run --rm \
+  -v "$FLOTILLA_DIR/src/val_data:/valdata" \
+  -v "$FLOTILLA_DIR/src/data:/data" \
+  -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
+  flotilla-server:${image_tag} python /generate_dataset.py
+
+echo "STAGE: Starting flotilla-server stack (server + redis + mosquitto)"
+mkdir -p deployment/checkpoints deployment/server_logs
+cd deployment
+DISCOVERY_TYPE=${discovery_type} IMAGE_TAG=${image_tag} \
+  docker compose -f docker-compose.yaml up -d
+echo "STAGE: flotilla-server started"

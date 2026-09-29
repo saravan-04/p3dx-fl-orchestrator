@@ -1,0 +1,147 @@
+#!/bin/bash
+# Rendered by null_resource.wait_for_combine_fl and run over SSH on the VM
+# itself right after it's created. Installs Docker, pulls the pre-built
+# flotilla images from GHCR, and starts the right one for `role`.
+#
+# Lines prefixed STAGE:/WARNING: are what vmAutoProvision.service.js's
+# remoteStageLineRe regex picks out of Terraform's "(remote-exec): ..."
+# output and surfaces as individual events in the VM-provisioning UI.
+set -euo pipefail
+
+FLOTILLA_DIR="/home/${admin_username}/flotilla"
+
+echo "STAGE: Installing Docker"
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sudo sh
+fi
+sudo systemctl enable --now docker
+sudo usermod -aG docker ${admin_username}
+
+if [ -n "${ghcr_token}" ]; then
+  echo "STAGE: Logging into ghcr.io"
+  echo "${ghcr_token}" | sudo docker login ghcr.io -u ${ghcr_namespace} --password-stdin
+else
+  echo "STAGE: Skipping ghcr.io login (no token provided, using public images)"
+fi
+
+mkdir -p "$FLOTILLA_DIR"
+cd "$FLOTILLA_DIR"
+
+echo "STAGE: Writing generate_dataset.py"
+printf '%s' "${generate_dataset_b64}" | base64 -d > generate_dataset.py
+
+%{ if role == "user" ~}
+echo "STAGE: Pulling flotilla-server and flotilla-session images"
+sudo docker pull ghcr.io/${ghcr_namespace}/flotilla-server:${image_tag}
+sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-server:${image_tag} flotilla-server:${image_tag}
+sudo docker pull ghcr.io/${ghcr_namespace}/flotilla-session:latest
+sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-session:latest flotilla-session:latest
+
+echo "STAGE: Generating validation dataset partition"
+mkdir -p src/val_data src/data
+sudo docker run --rm \
+  -v "$FLOTILLA_DIR/src/val_data:/valdata" \
+  -v "$FLOTILLA_DIR/src/data:/data" \
+  -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
+  flotilla-server:${image_tag} python /generate_dataset.py
+
+echo "STAGE: Writing server deployment config"
+mkdir -p deployment/checkpoints deployment/server_logs
+printf '%s' "${mosquitto_conf_b64}" | base64 -d > deployment/mosquitto.conf
+# Runtime-only compose file (no `build:` section) - the image is already
+# pulled+tagged above, so this never needs Flotilla_Deployment's source tree.
+cat > deployment/docker-compose.yaml <<'COMPOSE'
+services:
+  redis:
+    image: redis:7
+    container_name: flotilla-redis
+    command: redis-server --save 86400 1
+    networks: [flotilla-net]
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: flotilla-mqtt
+    networks: [flotilla-net]
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    restart: unless-stopped
+
+  server:
+    image: flotilla-server:${image_tag}
+    container_name: flotilla-server
+    depends_on: [redis, mosquitto]
+    networks: [flotilla-net]
+    ports:
+      - "12345:12345"
+      - "50051:50051"
+    environment:
+      DISCOVERY_TYPE: "${discovery_type}"
+      STATE_LOCATION: redis
+      STATE_HOSTNAME: redis
+      STATE_PORT: "6379"
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+      GRPC_DISCOVERY_PORT: "50051"
+      GRPC_TIMEOUT_S: "1200000"
+      REST_HOST: "0.0.0.0"
+      REST_PORT: "12345"
+      CHECKPOINT_DIR_PATH: /src/checkpoint
+      VALIDATION_DATA_DIR_PATH: /src/val_data
+      SERVER_TEMP_DIR_PATH: /src/scratch
+      MONITOR: "false"
+    volumes:
+      - ./server_logs:/src/logs
+      - ../src/val_data:/src/val_data
+      - ./checkpoints:/src/checkpoint
+      - ../models:/models
+    restart: unless-stopped
+
+networks:
+  flotilla-net:
+    name: flotilla-network
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+COMPOSE
+
+echo "STAGE: Starting flotilla-server stack (server + redis + mosquitto)"
+cd deployment
+sudo docker compose -f docker-compose.yaml up -d --no-build
+echo "STAGE: flotilla-server started"
+
+%{ else ~}
+echo "STAGE: Pulling flotilla-client image"
+sudo docker pull ghcr.io/${ghcr_namespace}/flotilla-client:${image_tag}
+sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-client:${image_tag} flotilla-client:${image_tag}
+
+echo "STAGE: Generating client dataset partition"
+mkdir -p src/data src/val_data
+sudo docker run --rm \
+  -v "$FLOTILLA_DIR/src/data:/data" \
+  -v "$FLOTILLA_DIR/src/val_data:/valdata" \
+  -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
+  flotilla-client:${image_tag} python /generate_dataset.py
+
+sudo docker rm -f flotilla-client >/dev/null 2>&1 || true
+%{ if server_host != "" ~}
+echo "STAGE: Starting flotilla-client (server=${server_host})"
+sudo docker run -d --name flotilla-client --network host --restart unless-stopped \
+  -e CLIENT_NAME=${participant_name} \
+  -e CLIENT_ADVERTISE_HOST=${client_advertise_host} \
+  -e SERVER_GRPC_HOST=${server_host} \
+  -e DISCOVERY_TYPE=${discovery_type} \
+  -e DATASETS_DIR_PATH=/data \
+  -v "$FLOTILLA_DIR/src/data:/data" \
+  flotilla-client:${image_tag}
+echo "STAGE: flotilla-client started"
+%{ else ~}
+echo "WARNING: no output-owner VM registered with governance layer yet — flotilla-client image pulled but not started. Start it once a server exists: docker run -d --name flotilla-client --network host -e CLIENT_NAME=${participant_name} -e CLIENT_ADVERTISE_HOST=${client_advertise_host} -e SERVER_GRPC_HOST=<server-ip> -e DATASETS_DIR_PATH=/data -v $FLOTILLA_DIR/src/data:/data flotilla-client:${image_tag}"
+%{ endif ~}
+%{ endif ~}

@@ -1,0 +1,27 @@
+# Copy to terraform.tfvars and fill in your own values, then:
+#   terraform init
+#   terraform apply
+
+subscription_id = "00000000-0000-0000-0000-000000000000" # your Azure subscription ID
+
+# One VM per entry, each running the flotilla-client container, all pointed
+# at the one orchestrator VM this run also creates.
+data_provider_names = ["dp1"] # e.g. ["dp1", "dp2"] for a 2-client run
+
+# Optional overrides (defaults shown):
+# participant_name_prefix = "flo-e2e"
+# location                = "centralindia"
+# vm_size                 = "Standard_B2als_v2" # 2 vCPU / 4 GiB
+# admin_username          = "azureuser"
+# ssh_public_key_path     = "~/.ssh/id_ed25519.pub"
+# ssh_private_key_path    = "~/.ssh/id_ed25519"
+# allowed_ssh_cidr        = "0.0.0.0/0"         # tighten to your own IP/32 when you can
+# allowed_fl_cidr         = "0.0.0.0/0"         # tighten once you know every VM's IP
+# discovery_type          = "grpc"
+# image_tag               = "cpu"
+# wait_timeout_s          = 900
+
+# Governance layer, used only to register each VM's IP for visibility (not
+# for client->server wiring, which is direct in this coordinated flow).
+# gov_layer_url   = "http://localhost:8083/api/v1"
+# gov_layer_token = ""                          # only if gov_layer has VM_REGISTRY_TOKEN set

@@ -1,0 +1,31 @@
+#!/bin/bash
+# Runs LOCALLY, on whatever machine executes `terraform apply` — not on the
+# VM. Registers this VM's own {role, participant_name, ip_address} with the
+# governance layer's vm-registry (p3dx_gov_layer's POST /vm-registry), so
+# other participants/tooling can look up this VM's IP later (e.g. a
+# data-provider looking up the output-owner's IP). A failure here (gov_layer
+# unreachable) is a warning, not fatal — it doesn't fail `terraform apply`.
+#
+# User-facing lines are prefixed "STAGE:"/"WARNING:" — p3dx-aaa's
+# vmAutoProvision.service.js greps for that prefix to surface each one as its
+# own step in the provisioning UI.
+set -uo pipefail
+
+SELF_IP="${self_ip}"
+ROLE="${role}"
+PARTICIPANT_NAME="${participant_name}"
+GOV_URL="${gov_layer_url}"
+TOKEN="${gov_layer_token}"
+
+auth_header=()
+if [ -n "$TOKEN" ]; then
+  auth_header=(-H "X-VM-Registry-Token: $TOKEN")
+fi
+
+echo "STAGE: Registering this VM ($ROLE/$PARTICIPANT_NAME @ $SELF_IP) with governance layer"
+if ! curl -sf -X POST "$GOV_URL/vm-registry" \
+  -H "Content-Type: application/json" \
+  "$${auth_header[@]}" \
+  -d "{\"role\":\"$ROLE\",\"participant_name\":\"$PARTICIPANT_NAME\",\"ip_address\":\"$SELF_IP\"}" >/dev/null; then
+  echo "WARNING: failed to register this VM with governance layer — is it running at $GOV_URL? Continuing anyway."
+fi

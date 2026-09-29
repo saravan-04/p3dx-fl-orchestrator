@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and fill in your own values, then:
+#   terraform init
+#   terraform apply
+#
+# Targets VMs that ALREADY EXIST (created via terraform/participant-vm's
+# deploy.sh) — this does not create any VM itself.
+
+subscription_id = "00000000-0000-0000-0000-000000000000" # the subscription that owns the VMs below
+
+orchestrator_participant_name   = "user1"          # -> flo-user-user1
+data_provider_participant_names = ["data-provider5"] # -> flo-data-provider-data-provider5
+
+# Optional overrides (defaults shown):
+# discovery_type  = "grpc"
+# image_tag       = "cpu"
+# wait_timeout_s  = 900
+# allowed_fl_cidr = "0.0.0.0/0"   # tighten once you know every VM's IP

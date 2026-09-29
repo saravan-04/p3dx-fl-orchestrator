@@ -1,0 +1,4 @@
+.env
+*.exe
+/p3dx-fl-orchestrator
+terraform/

@@ -1,0 +1,276 @@
+// Package flauto automatically starts the actual FL training session once
+// the output-owner's server VM is up AND every provider selected for that
+// submission has connected their client — this is "the post flow" that runs
+// after the fl-orchestrator operator clicks "Sign in with Azure & Start
+// Session": nothing else in this platform ever calls flo_server.py's
+// POST /execute_command otherwise.
+//
+// Ported from p3dx-aaa/src/services/flSessionAuto.service.js. Readiness is
+// judged by *count* (connected clients >= selected providers), not identity —
+// flo_server's /client_status keys clients by whatever CLIENT_NAME each
+// provider's VM was given, which is an arbitrary name they typed, not their
+// platform username.
+//
+// Progress is surfaced by piggybacking on the existing VM-provisioning SSE
+// plumbing (vmsession.Store.AppendEvent) rather than a new stream: every
+// provisioning token associated with this submission (the owner's VM run,
+// plus each provider's VM run) gets the same "Waiting for clients"/"Starting
+// FL session" events appended.
+package flauto
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"regexp"
+	"sync"
+	"time"
+
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
+)
+
+const (
+	flServerPort = 12345
+	pollInterval = 5 * time.Second
+	maxWait      = 2 * time.Hour // give up after 2h of not everyone connecting
+)
+
+var nonAlnum = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+type submissionState struct {
+	mu                    sync.Mutex
+	expectedProviderCount int
+	ownerIP               string
+	tokens                map[string]struct{}
+	lastConnectedCount    int
+	started               bool
+	polling               bool
+	pollStartedAt         time.Time
+}
+
+// Manager tracks FL auto-start state per submission.
+type Manager struct {
+	store *vmsession.Store
+	http  *http.Client
+
+	mu          sync.Mutex
+	submissions map[string]*submissionState
+}
+
+func NewManager(store *vmsession.Store) *Manager {
+	return &Manager{
+		store:       store,
+		http:        &http.Client{Timeout: 5 * time.Second},
+		submissions: make(map[string]*submissionState),
+	}
+}
+
+func (m *Manager) getOrCreate(submissionID string) *submissionState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.submissions[submissionID]
+	if !ok {
+		s = &submissionState{
+			tokens:             make(map[string]struct{}),
+			lastConnectedCount: -1,
+		}
+		m.submissions[submissionID] = s
+	}
+	return s
+}
+
+func (m *Manager) emit(s *submissionState, step, status, message string) {
+	s.mu.Lock()
+	tokens := make([]string, 0, len(s.tokens))
+	for t := range s.tokens {
+		tokens = append(tokens, t)
+	}
+	s.mu.Unlock()
+	for _, token := range tokens {
+		m.store.AppendEvent(token, step, "", status, message)
+	}
+}
+
+// RegisterExpectedProviders is called once POST /internal/register-expected-providers
+// (from p3dx-aaa's /gov/start-fl-session, which already knows the full
+// participating_providers list) arrives for this submission.
+func (m *Manager) RegisterExpectedProviders(submissionID string, count int) {
+	if submissionID == "" || count == 0 {
+		return
+	}
+	s := m.getOrCreate(submissionID)
+	s.mu.Lock()
+	s.expectedProviderCount = count
+	s.mu.Unlock()
+	m.maybeStartPolling(submissionID, s)
+}
+
+// RegisterProviderToken is called once a provider's own VM auto-create run
+// has a token, so they get the fan-out events on their panel too.
+func (m *Manager) RegisterProviderToken(submissionID, token string) {
+	if submissionID == "" || token == "" {
+		return
+	}
+	s := m.getOrCreate(submissionID)
+	s.mu.Lock()
+	s.tokens[token] = struct{}{}
+	s.mu.Unlock()
+}
+
+// RegisterOwnerVM is called once the owner's ("user" role) VM run succeeds
+// and its public IP is known — that VM is the one running flo_server.py.
+func (m *Manager) RegisterOwnerVM(submissionID, ip, token string) {
+	if submissionID == "" || ip == "" {
+		return
+	}
+	s := m.getOrCreate(submissionID)
+	s.mu.Lock()
+	s.ownerIP = ip
+	if token != "" {
+		s.tokens[token] = struct{}{}
+	}
+	s.mu.Unlock()
+	m.maybeStartPolling(submissionID, s)
+}
+
+func (m *Manager) maybeStartPolling(submissionID string, s *submissionState) {
+	s.mu.Lock()
+	if s.polling || s.started || s.ownerIP == "" || s.expectedProviderCount == 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.polling = true
+	s.pollStartedAt = time.Now()
+	expected := s.expectedProviderCount
+	s.mu.Unlock()
+
+	m.emit(s, "Waiting for clients", "running", fmt.Sprintf("0/%d providers connected", expected))
+
+	go m.pollLoop(submissionID, s)
+}
+
+func (m *Manager) pollLoop(submissionID string, s *submissionState) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	m.pollOnce(submissionID, s)
+	for range ticker.C {
+		if m.pollOnce(submissionID, s) {
+			return
+		}
+	}
+}
+
+// pollOnce returns true once polling should stop (started or gave up).
+func (m *Manager) pollOnce(submissionID string, s *submissionState) bool {
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return true
+	}
+	if time.Since(s.pollStartedAt) > maxWait {
+		expected := s.expectedProviderCount
+		s.mu.Unlock()
+		m.emit(s, "Waiting for clients", "error",
+			fmt.Sprintf("Gave up after 2h — not all %d provider(s) connected. Start the session manually over SSH once they do.", expected))
+		return true
+	}
+	ownerIP := s.ownerIP
+	expected := s.expectedProviderCount
+	lastCount := s.lastConnectedCount
+	s.mu.Unlock()
+
+	count, err := m.clientCount(ownerIP)
+	if err != nil {
+		// server VM likely still booting/pulling images - not worth surfacing every 5s
+		return false
+	}
+
+	if count != lastCount {
+		s.mu.Lock()
+		s.lastConnectedCount = count
+		s.mu.Unlock()
+		m.emit(s, "Waiting for clients", "running", fmt.Sprintf("%d/%d providers connected", count, expected))
+	}
+
+	if count >= expected {
+		s.mu.Lock()
+		s.started = true
+		s.mu.Unlock()
+		m.startSession(submissionID, s)
+		return true
+	}
+	return false
+}
+
+func (m *Manager) clientCount(ownerIP string) (int, error) {
+	url := fmt.Sprintf("http://%s:%d/client_status", ownerIP, flServerPort)
+	resp, err := m.http.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Clients map[string]any `json:"clients"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0, err
+	}
+	return len(body.Clients), nil
+}
+
+func (m *Manager) startSession(submissionID string, s *submissionState) {
+	m.emit(s, "Starting FL session", "running", "All expected providers connected — starting training")
+
+	sessionID := nonAlnum.ReplaceAllString(submissionID, "_")
+	body := map[string]any{
+		"federated_learning_config": flotillaQuicksetupConfig,
+		"session_id":                sessionID,
+		"file":                      false,
+		"restore":                   false,
+		"revive":                    false,
+	}
+	payload, _ := json.Marshal(body)
+
+	s.mu.Lock()
+	ownerIP := s.ownerIP
+	s.mu.Unlock()
+
+	// POST /execute_command blocks server-side until the whole training run
+	// finishes (could be a long time) - fire it and move on instead of
+	// blocking this goroutine on it; its eventual resolution/rejection
+	// becomes one more event for whoever's still watching this submission's
+	// panels.
+	go func() {
+		url := fmt.Sprintf("http://%s:%d/execute_command", ownerIP, flServerPort)
+		client := &http.Client{} // no timeout — mirrors the Node version's timeout: 0
+		resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			m.emit(s, "FL session", "error", err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		if resp.StatusCode >= 300 {
+			msg := out.Message
+			if msg == "" {
+				msg = fmt.Sprintf("flo_server returned status %d", resp.StatusCode)
+			}
+			m.emit(s, "FL session", "error", msg)
+			return
+		}
+		msg := out.Message
+		if msg == "" {
+			msg = fmt.Sprintf("Session %s finished", sessionID)
+		}
+		m.emit(s, "FL session", "done", msg)
+	}()
+
+	m.emit(s, "Starting FL session", "ok", fmt.Sprintf("Session %s started — training is now running on the server VM", sessionID))
+	log.Printf("[flauto] submission %s: FL session %s started on %s", submissionID, sessionID, ownerIP)
+}
